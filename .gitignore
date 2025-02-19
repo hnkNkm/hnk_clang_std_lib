@@ -1,0 +1,36 @@
+# オブジェクトファイルや中間生成物
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# バイナリ実行ファイル
+*.exe
+*.out
+*.app
+
+# test/の実行ファイル
+test/*
+!test/*.c
+
+# デバッグファイル・カバレッジ関連
+*.gcno
+*.gcda
+*.gcov
+
+# 一時ファイル
+*~
+*.swp
+*.swo
+.DS_Store
+
+# ビルドディレクトリ（MakefileやCMakeの出力）
+/build/
+/cmake-build-debug/
+/cmake-build-release/
+
+# IDE の設定ファイル
+.idea/
+.vscode/
