@@ -1,19 +1,26 @@
-; Syscallに依存せず、固定ヒープ領域からメモリを確保するシンプルな実装
-; フリーリスト方式
+; 各ブロックは16バイトのヘッダを持ち、ヘッダは以下の構造：
+;   [0]: ブロックサイズ（ブロック全体のサイズ、ヘッダを含む）
+;   [8]: 次の空きブロックへのポインタ（空きブロックの場合のみ利用）
+; ユーザーにはヘッダの直後のアドレスが返る。
 
 section .bss
     ; 1MB の静的ヒープ領域
     heap       resb 1048576
-    ; free_list: 空きブロックの先頭ポインタ（未初期化）
+    ; free_list: 空きブロックの先頭ポインタ（初期状態は未初期化）
     free_list  resq 1
 
 section .data
-    ; ヒープ終端の値：heapのアドレス + 1048576
-    heap_end   dq (heap + 1048576)
+    ; ヒープ終端の値：heap のアドレス + 1048576
+    heap_end   dq heap + 1048576
 
 section .text
 global my_malloc
 global my_free
+
+; ヘッダサイズ定義（サイズ＋次ポインタ）
+%define HEADER_SIZE 16
+; 分割可能な最小サイズ（ここでは、ヘッダ＋最低8バイトのユーザーデータ領域＝24バイト未満は分割しない）
+%define MIN_SPLIT_SIZE (HEADER_SIZE + 8)
 
 ; ------------------------------------------------
 ; void* my_malloc(size_t size)
@@ -23,59 +30,122 @@ global my_free
 ;      RAX = 確保したメモリのポインタ（失敗時はNULL）
 ; ------------------------------------------------
 my_malloc:
-    mov rsi, [free_list]   ; 空きリストの先頭を取得
-    test rsi, rsi          ; NULLかどうかチェック
-    jz  .init_heap         ; 初回ならヒープ初期化へ
-    jmp .search_block
+    ; 0バイト要求なら NULL を返す
+    test rdi, rdi
+    jz .return_null
 
-.init_heap:
-    mov rsi, heap          ; ヒープ先頭を空きブロックとして設定
-    mov [free_list], rsi   ; free_list更新
-    ; ヒープの終端を、レジスタに読み込んでから書き込む
-    mov rax, heap_end      ; rax に heap_end の値をセット
-    mov [rsi], rax         ; 現在のブロックのヘッダに heap_end を記録
-    add rsi, 8             ; データ領域開始
-    jmp .search_block
+    ; アライメント調整（8バイト境界に丸める）
+    mov rax, rdi
+    add rax, 7
+    and rax, -8
+    mov rdi, rax
+
+    ; 必要ブロックサイズ = 要求サイズ + ヘッダサイズ
+    mov rax, rdi
+    add rax, HEADER_SIZE
+    mov rcx, rax    ; rcx に調整後の必要サイズ
+
+    ; free_list をチェック、NULLならヒープを初期化
+    mov rsi, [free_list]
+    test rsi, rsi
+    jnz .search_block
+
+    ; ヒープ初期化：ヒープ全体を1つの空きブロックにする
+    mov rsi, heap
+    mov [free_list], rsi
+    ; ブロックサイズ = heap_end - heap
+    mov rax, [heap_end]
+    sub rax, heap
+    mov [rsi], rax
+    ; 次ポインタを初期化
+    mov qword [rsi+8], 0
 
 .search_block:
-    mov rdx, rsi           ; 現在のブロックの開始アドレス（データ部分ではなくヘッダ）
-    add rdx, 8             ; データ領域の先頭アドレス
-    cmp rdx, [heap_end]    ; ヒープ終端と比較
-    jae .malloc_fail
+    ; rsi: 現在の空きブロックの先頭アドレス
+    ; rbx: 直前のブロック（更新用、無ければ0）
+    xor rbx, rbx
 
-    mov rcx, [rsi]         ; 現在のブロックの次のブロックのアドレス（ヘッダに記録されている）
-    sub rcx, rsi          ; 現在のブロックのサイズ
-    cmp rcx, rdi          ; 要求サイズと比較
-    jb  .next_block       ; サイズ不足なら次のブロックへ
+.search_loop:
+    test rsi, rsi
+    jz .return_null       ; 空きブロックが見つからなければ失敗
 
-    ; 十分なサイズがある場合、このブロックを使用する
-    mov rax, rsi          ; 返すアドレス = 現在のブロックのヘッダ
-    add rax, 8            ; ユーザーが使えるデータ領域
-    add rsi, rdi          ; free_list を更新：現在のブロックを後方へ進める
-    mov [free_list], rsi
+    ; 現在のブロックサイズを取得
+    mov rdx, [rsi]        ; rdx = ブロックサイズ（ヘッダ含む）
+    cmp rdx, rcx          ; 必要サイズと比較
+    jb .not_enough
+
+    ; 十分なサイズがある
+    ; 残りサイズ = 現在のブロックサイズ - 必要サイズ
+    mov r8, rdx
+    sub r8, rcx
+    ; 分割可能か判定：残りサイズが MIN_SPLIT_SIZE 以上なら分割する
+    mov r9, MIN_SPLIT_SIZE
+    cmp r8, r9
+    jb .use_whole_block
+
+    ; --- ブロック分割 ---
+    ; 割り当て部分：先頭 rcx バイトを使用
+    ; 残り部分：r8 バイト、アドレスは (rsi + rcx)
+    lea r10, [rsi + rcx]
+    ; 新たな空きブロックのヘッダを設定
+    mov [r10], r8           ; サイズを設定
+    ; 現在のブロックの次ポインタを新ブロックにコピー
+    mov r11, [rsi+8]
+    mov [r10+8], r11
+
+    ; free_list から現在のブロックを除去
+    cmp rbx, 0
+    je .update_free_list_head_split
+    mov [rbx+8], r10        ; 前のブロックの next を更新
+    jmp .return_alloc
+
+.update_free_list_head_split:
+    mov [free_list], r10
+    jmp .return_alloc
+
+.use_whole_block:
+    ; --- ブロック全体を使用（分割しない） ---
+    cmp rbx, 0
+    je .update_free_list_head_whole
+    ; 前のブロックの next を現在のブロックの next に更新
+    mov rax, [rsi+8]
+    mov [rbx+8], rax
+    jmp .return_alloc
+
+.update_free_list_head_whole:
+    mov rax, [rsi+8]
+    mov [free_list], rax
+
+.return_alloc:
+    ; rsi は割り当てたブロックの先頭（ヘッダ位置）
+    ; ユーザーデータ領域の先頭は (rsi + HEADER_SIZE)
+    lea rax, [rsi + HEADER_SIZE]
     ret
 
-.next_block:
-    mov rsi, [rsi]        ; 次の空きブロックのアドレスに更新
-    jmp .search_block
+.not_enough:
+    ; 次のブロックへ
+    mov rbx, rsi          ; 現在のブロックを previous として記憶
+    mov rsi, [rsi+8]      ; 次の空きブロックへ
+    jmp .search_loop
 
-.malloc_fail:
-    xor rax, rax          ; 失敗時は NULL (0) を返す
+.return_null:
+    xor rax, rax
     ret
 
 ; ------------------------------------------------
 ; void my_free(void* ptr)
 ;  引数:
-;      RDI = 解放するメモリのポインタ
+;      RDI = 解放するメモリのポインタ（ユーザーデータ領域の先頭）
 ; ------------------------------------------------
 my_free:
-    test rdi, rdi         ; ptrがNULLなら何もしない
-    jz   .free_done
-    sub  rdi, 8           ; ユーザー領域からヘッダに戻す
-    ; 解放したブロックを、free_listの先頭にリンクする
-    mov rax, [free_list]   ; 現在のfree_list
-    mov [rdi], rax         ; 解放ブロックのヘッダに、以前のfree_listをセット
-    mov [free_list], rdi   ; free_list を更新
+    test rdi, rdi
+    jz .free_done
+    ; ブロックヘッダの先頭を得るために HEADER_SIZE (16) バイト戻る
+    sub rdi, HEADER_SIZE
+    ; 単純に free_list の先頭に連結する
+    mov rax, [free_list]
+    mov [rdi+8], rax
+    mov [free_list], rdi
 .free_done:
     ret
 
